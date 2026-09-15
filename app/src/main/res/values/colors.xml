@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="white">#FFFFFFFF</color>
+    <color name="black">#FF000000</color>
+    <!-- Brand colours taken from the Smesco logo -->
+    <color name="smesco_teal">#FF1B9BB5</color>
+    <color name="smesco_teal_dark">#FF157D93</color>
+    <color name="smesco_navy">#FF1D3557</color>
+    <color name="smesco_gold">#FFD9B44A</color>
+</resources>
