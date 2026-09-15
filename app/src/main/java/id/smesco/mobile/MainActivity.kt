@@ -129,13 +129,24 @@ class MainActivity : AppCompatActivity() {
     private fun setupDownloadListener() {
         webView.setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
             try {
-                val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
-                val request = DownloadManager.Request(Uri.parse(url))
+                if (url.startsWith("blob:") || url.startsWith("data:")) {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Berkas dibuat di dalam halaman, tidak bisa diunduh langsung",
+                        Toast.LENGTH_LONG
+                    ).show()
+                    return@setDownloadListener
+                }
 
-                request.setMimeType(mimeType)
+                val fileName = resolveFileName(url, contentDisposition, mimeType)
+
+                val request = DownloadManager.Request(Uri.parse(url))
                 request.addRequestHeader("User-Agent", userAgent)
                 val cookies = CookieManager.getInstance().getCookie(url)
                 if (cookies != null) request.addRequestHeader("Cookie", cookies)
+                // Jangan pakai MIME mentah dari server: kalau octet-stream,
+                // Android ikut menebak dan berkas jatuh menjadi .bin
+                request.setMimeType(mimeTypeFromName(fileName) ?: mimeType)
                 request.setDescription("Mengunduh berkas...")
                 request.setTitle(fileName)
                 request.allowScanningByMediaScanner()
@@ -152,10 +163,96 @@ class MainActivity : AppCompatActivity() {
 
                 Toast.makeText(this@MainActivity, "Mengunduh: $fileName", Toast.LENGTH_SHORT).show()
             } catch (e: Exception) {
-                Toast.makeText(this@MainActivity, "Gagal mengunduh: ${e.message}", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "Gagal mengunduh: ${e.message}", Toast.LENGTH_LONG).show()
             }
         }
     }
+
+    /**
+     * Menentukan nama berkas dengan urutan: header Content-Disposition (termasuk
+     * format RFC 5987 `filename*=UTF-8''nama.csv`), lalu ruas terakhir URL, lalu
+     * tebakan bawaan Android. Ekstensi ditambal dari parameter URL bila perlu,
+     * supaya hasil export tidak jatuh menjadi .bin.
+     */
+    private fun resolveFileName(url: String, contentDisposition: String?, mimeType: String?): String {
+        var name: String? = null
+
+        if (!contentDisposition.isNullOrBlank()) {
+            // filename*=UTF-8''laporan%20mei.csv
+            Regex("""filename\*\s*=\s*[^']*''([^;\s]+)""", RegexOption.IGNORE_CASE)
+                .find(contentDisposition)?.groupValues?.get(1)?.let {
+                    name = try { Uri.decode(it) } catch (e: Exception) { it }
+                }
+            // filename="laporan.csv"
+            if (name.isNullOrBlank()) {
+                Regex("""filename\s*=\s*"?([^";]+)"?""", RegexOption.IGNORE_CASE)
+                    .find(contentDisposition)?.groupValues?.get(1)?.let { name = it.trim() }
+            }
+        }
+
+        // Ruas terakhir dari path URL, mis. /export/laporan.csv
+        if (name.isNullOrBlank()) {
+            val path = try { Uri.parse(url).lastPathSegment } catch (e: Exception) { null }
+            if (!path.isNullOrBlank() && path.contains(".")) name = path
+        }
+
+        if (name.isNullOrBlank()) {
+            name = URLUtil.guessFileName(url, contentDisposition, mimeType)
+        }
+
+        var clean = name!!.substringAfterLast('/').substringAfterLast('\\')
+            .replace(Regex("""[\\/:*?"<>|]"""), "_")
+            .trim()
+
+        // Kalau masih tanpa ekstensi atau jatuh ke .bin, tebak dari URL lalu dari MIME
+        if (clean.endsWith(".bin", true) || !clean.contains(".")) {
+            val base = clean.removeSuffix(".bin").ifBlank { "download" }
+            val ext = extFromUrl(url) ?: extFromMime(mimeType)
+            if (ext != null) clean = "$base.$ext"
+        }
+
+        return clean.ifBlank { "download_${System.currentTimeMillis()}" }
+    }
+
+    /** Menebak ekstensi dari URL, termasuk pola ?format=csv / ?type=xlsx / ?export=pdf */
+    private fun extFromUrl(url: String): String? {
+        val known = listOf("csv", "xlsx", "xls", "pdf", "docx", "doc", "zip", "txt", "json", "xml", "png", "jpg", "jpeg")
+        val lower = url.lowercase()
+        Regex("""[?&](?:format|type|ext|export|output)=([a-z0-9]{2,5})""").find(lower)
+            ?.groupValues?.get(1)?.let { if (it in known) return it }
+        known.forEach { if (lower.contains(".$it?") || lower.endsWith(".$it")) return it }
+        return null
+    }
+
+    private fun extFromMime(mimeType: String?): String? = when {
+        mimeType == null -> null
+        mimeType.contains("csv") -> "csv"
+        mimeType.contains("spreadsheetml") -> "xlsx"
+        mimeType.contains("ms-excel") -> "xls"
+        mimeType.contains("pdf") -> "pdf"
+        mimeType.contains("wordprocessingml") -> "docx"
+        mimeType.contains("msword") -> "doc"
+        mimeType.contains("zip") -> "zip"
+        mimeType.contains("json") -> "json"
+        mimeType.startsWith("text/plain") -> "txt"
+        else -> null
+    }
+
+    private fun mimeTypeFromName(fileName: String): String? =
+        when (fileName.substringAfterLast('.', "").lowercase()) {
+            "csv" -> "text/csv"
+            "xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            "xls" -> "application/vnd.ms-excel"
+            "pdf" -> "application/pdf"
+            "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            "doc" -> "application/msword"
+            "zip" -> "application/zip"
+            "txt" -> "text/plain"
+            "json" -> "application/json"
+            else -> null
+        }
+
+    // ---------- Permissions ----------
 
     private fun requestInitialPermissions() {
         val perms = mutableListOf(
