@@ -10,10 +10,18 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.print.PdfPrintHelper
+import android.print.PrintAttributes
+import android.print.PrintManager
 import android.provider.MediaStore
+import android.provider.Settings
+import android.util.Base64
 import android.view.View
 import android.webkit.CookieManager
 import android.webkit.GeolocationPermissions
+import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
@@ -24,6 +32,12 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.ProgressBar
 import android.widget.Toast
+import android.bluetooth.BluetoothAdapter
+import android.content.SharedPreferences
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.ActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -31,7 +45,14 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.snackbar.Snackbar
+import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -56,6 +77,18 @@ class MainActivity : AppCompatActivity() {
     private var geoCallback: GeolocationPermissions.Callback? = null
     private var webRtcRequest: PermissionRequest? = null
 
+    // Print + Bluetooth printer
+    private lateinit var btPrinter: BluetoothPrinter
+    private lateinit var prefs: SharedPreferences
+    private val printExecutor = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val jobCounter = AtomicInteger(0)
+    private var btPendingContinue: (() -> Unit)? = null
+    private var btPendingCancel: (() -> Unit)? = null
+
+    /** URL halaman yang sedang tampil; jembatan JS hanya melayani situs sendiri. */
+    @Volatile private var currentUrl: String? = null
+
     // ---------- Activity result launchers ----------
 
     private val initialPermissionLauncher =
@@ -79,6 +112,20 @@ class MainActivity : AppCompatActivity() {
             webRtcRequest = null
         }
 
+    private val btPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+            if (result.values.all { it }) resumeBluetoothFlow()
+            else {
+                toast("Izin Bluetooth ditolak, printer tidak bisa dipakai")
+                cancelBluetoothFlow()
+            }
+        }
+
+    private val btEnableLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+            if (btPrinter.isEnabled()) resumeBluetoothFlow() else cancelBluetoothFlow()
+        }
+
     private val fileChooserLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
             handleFileChooserResult(result)
@@ -91,7 +138,13 @@ class MainActivity : AppCompatActivity() {
         // Switch from the launch (splash) theme to the normal app theme
         setTheme(R.style.Theme_SmescoApp)
         super.onCreate(savedInstanceState)
+        // Diperlukan agar seluruh halaman (bukan hanya bagian yang terlihat)
+        // bisa digambar ke bitmap untuk cetak Bluetooth cadangan
+        WebView.enableSlowWholeDocumentDraw()
         setContentView(R.layout.activity_main)
+
+        btPrinter = BluetoothPrinter(this)
+        prefs = getSharedPreferences("smesco_print", Context.MODE_PRIVATE)
 
         webView = findViewById(R.id.webView)
         progressBar = findViewById(R.id.progressBar)
@@ -130,11 +183,10 @@ class MainActivity : AppCompatActivity() {
         webView.setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
             try {
                 if (url.startsWith("blob:") || url.startsWith("data:")) {
-                    Toast.makeText(
-                        this@MainActivity,
-                        "Berkas dibuat di dalam halaman, tidak bisa diunduh langsung",
-                        Toast.LENGTH_LONG
-                    ).show()
+                    // Berkas dibuat di dalam halaman (mis. PDF/Excel dari JavaScript):
+                    // isinya dibaca oleh skrip halaman lalu dikirim ke aplikasi
+                    val name = contentDispositionName(contentDisposition) ?: ""
+                    saveInPageUrl(url, name, openAfter = false)
                     return@setDownloadListener
                 }
 
@@ -252,6 +304,455 @@ class MainActivity : AppCompatActivity() {
             else -> null
         }
 
+    private fun contentDispositionName(contentDisposition: String?): String? {
+        if (contentDisposition.isNullOrBlank()) return null
+        Regex("""filename\*\s*=\s*[^']*''([^;\s]+)""", RegexOption.IGNORE_CASE)
+            .find(contentDisposition)?.groupValues?.get(1)?.let {
+                return try { Uri.decode(it) } catch (e: Exception) { it }
+            }
+        return Regex("""filename\s*=\s*"?([^";]+)"?""", RegexOption.IGNORE_CASE)
+            .find(contentDisposition)?.groupValues?.get(1)?.trim()?.ifBlank { null }
+    }
+
+    // ---------- Berkas blob: / data: dari dalam halaman ----------
+
+    /** Minta skrip halaman membaca isi blob:/data: lalu mengirimnya ke [NativeBridge.saveFile]. */
+    private fun saveInPageUrl(url: String, name: String, openAfter: Boolean) {
+        if (url.startsWith("data:")) {
+            saveDataUrl(url, name, openAfter)
+            return
+        }
+        injectBridge(webView)
+        val js = "window.__smescoSave && window.__smescoSave(" +
+            JSONObject.quote(url) + "," + JSONObject.quote(name) + "," + openAfter + ")"
+        webView.evaluateJavascript(js, null)
+    }
+
+    private fun saveDataUrl(dataUrl: String, name: String, openAfter: Boolean) {
+        printExecutor.execute {
+            try {
+                val (mime, bytes) = DownloadSaver.decodeDataUrl(dataUrl)
+                val fileName = finalFileName(name, mime)
+                val saved = DownloadSaver.save(this, fileName, mimeTypeFromName(fileName) ?: mime, bytes)
+                runOnUiThread { onFileSaved(saved, openAfter) }
+            } catch (e: Exception) {
+                runOnUiThread { toast("Gagal menyimpan berkas: ${e.message}") }
+            }
+        }
+    }
+
+    private fun finalFileName(name: String, mime: String): String {
+        var clean = name.substringAfterLast('/').substringAfterLast('\\')
+            .replace(Regex("""[\\/:*?"<>|]"""), "_").trim()
+        if (clean.isBlank()) {
+            clean = "smesco_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        }
+        if (!clean.contains(".") || clean.endsWith(".bin", true)) {
+            val ext = extFromMime(mime) ?: when {
+                mime.contains("png") -> "png"
+                mime.contains("jpeg") || mime.contains("jpg") -> "jpg"
+                mime.startsWith("text/html") -> "html"
+                else -> null
+            }
+            if (ext != null) clean = clean.removeSuffix(".bin") + "." + ext
+        }
+        return clean
+    }
+
+    private fun onFileSaved(saved: DownloadSaver.Saved, openAfter: Boolean) {
+        val open = {
+            try {
+                startActivity(DownloadSaver.openIntent(saved))
+            } catch (e: Exception) {
+                toast("Tidak ada aplikasi untuk membuka ${saved.displayName}")
+            }
+        }
+        if (openAfter) {
+            toast("Tersimpan di Download: ${saved.displayName}")
+            open()
+        } else {
+            Snackbar.make(webView, "Tersimpan di Download: ${saved.displayName}", Snackbar.LENGTH_LONG)
+                .setAction("Buka") { open() }
+                .show()
+        }
+    }
+
+    // ---------- Print ----------
+
+    /** Dipanggil saat halaman menjalankan window.print(). */
+    private fun showPrintChooser(title: String) {
+        val printerName = savedPrinter()?.name
+        val items = arrayOf(
+            "Printer biasa / Simpan sebagai PDF",
+            "Printer thermal Bluetooth" + (printerName?.let { " ($it)" } ?: ""),
+            "Pilih printer Bluetooth & ukuran kertas"
+        )
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Cetak")
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> systemPrint(title)
+                    1 -> printPageBluetooth(newJobId())
+                    2 -> withBluetooth(forcePick = true, onReady = { p ->
+                        toast("Printer: ${p.name}, kertas ${paperMm()}mm")
+                    })
+                }
+            }
+            .setNegativeButton("Batal", null)
+            .show()
+    }
+
+    private fun systemPrint(title: String) {
+        val jobName = title.ifBlank { getString(R.string.app_name) }
+        val pm = getSystemService(Context.PRINT_SERVICE) as PrintManager
+        try {
+            pm.print(jobName, webView.createPrintDocumentAdapter(jobName), PrintAttributes.Builder().build())
+        } catch (e: Exception) {
+            toast("Tidak bisa membuka dialog cetak: ${e.message}")
+        }
+    }
+
+    private fun newJobId() = "job" + jobCounter.incrementAndGet()
+
+    /** Kabari halaman lewat event `smescoprint` (dipakai oleh window.SmescoPrint). */
+    private fun reportJob(job: String, ok: Boolean, message: String, extra: JSONObject? = null) {
+        mainHandler.post {
+            if (!ok && message != "Dibatalkan") toast(message)
+            val detail = (extra ?: JSONObject()).put("job", job).put("ok", ok).put("message", message)
+            webView.evaluateJavascript(
+                "window.dispatchEvent(new CustomEvent('smescoprint',{detail:$detail}))", null
+            )
+        }
+    }
+
+    // --- Pengaturan printer ---
+
+    private fun paperMm() = prefs.getInt("paper_mm", 58)
+
+    private fun savedPrinter(): BluetoothPrinter.Printer? {
+        val addr = prefs.getString("bt_address", null) ?: return null
+        return BluetoothPrinter.Printer(prefs.getString("bt_name", null) ?: addr, addr)
+    }
+
+    private fun printerJson(): JSONObject? = savedPrinter()?.let {
+        JSONObject().put("name", it.name).put("address", it.address)
+            .put("paper", paperMm()).put("columns", BluetoothPrinter.charsForPaper(paperMm()))
+    }
+
+    /**
+     * Pastikan Bluetooth siap: izin, Bluetooth menyala, dan printer sudah dipilih.
+     * Setiap langkah yang butuh jawaban pengguna akan memanggil ulang fungsi ini.
+     */
+    private fun withBluetooth(
+        forcePick: Boolean = false,
+        onReady: (BluetoothPrinter.Printer) -> Unit,
+        onCancel: () -> Unit = {}
+    ) {
+        if (!btPrinter.isSupported()) {
+            toast("Perangkat ini tidak mendukung Bluetooth")
+            onCancel(); return
+        }
+        val again = { withBluetooth(forcePick, onReady, onCancel) }
+
+        val missing = bluetoothPermissions().filter { !hasPermission(it) }
+        if (missing.isNotEmpty()) {
+            btPendingContinue = again; btPendingCancel = onCancel
+            btPermissionLauncher.launch(missing.toTypedArray())
+            return
+        }
+        if (!btPrinter.isEnabled()) {
+            btPendingContinue = again; btPendingCancel = onCancel
+            try {
+                btEnableLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+            } catch (e: Exception) {
+                btPendingContinue = null; btPendingCancel = null
+                toast("Nyalakan Bluetooth terlebih dahulu")
+                onCancel()
+            }
+            return
+        }
+        val saved = savedPrinter()
+        val stillPaired = saved != null && btPrinter.pairedDevices().any { it.address == saved.address }
+        if (forcePick || !stillPaired) {
+            pickPrinter(onPicked = { withBluetooth(false, onReady, onCancel) }, onCancel = onCancel)
+            return
+        }
+        onReady(saved!!)
+    }
+
+    private fun bluetoothPermissions(): List<String> =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) listOf(Manifest.permission.BLUETOOTH_CONNECT)
+        else emptyList()
+
+    private fun resumeBluetoothFlow() {
+        val next = btPendingContinue
+        btPendingContinue = null; btPendingCancel = null
+        next?.invoke()
+    }
+
+    private fun cancelBluetoothFlow() {
+        val cancel = btPendingCancel
+        btPendingContinue = null; btPendingCancel = null
+        cancel?.invoke()
+    }
+
+    private fun pickPrinter(onPicked: () -> Unit, onCancel: () -> Unit) {
+        val devices = btPrinter.pairedDevices()
+        if (devices.isEmpty()) {
+            MaterialAlertDialogBuilder(this)
+                .setTitle("Belum ada printer")
+                .setMessage(
+                    "Nyalakan printer, lalu pair (sandingkan) dulu di pengaturan Bluetooth HP. " +
+                        "PIN printer thermal biasanya 0000 atau 1234. Setelah itu coba cetak lagi."
+                )
+                .setPositiveButton("Buka pengaturan Bluetooth") { _, _ ->
+                    try { startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) } catch (_: Exception) { }
+                    onCancel()
+                }
+                .setNegativeButton("Batal") { _, _ -> onCancel() }
+                .setOnCancelListener { onCancel() }
+                .show()
+            return
+        }
+        val current = prefs.getString("bt_address", null)
+        val labels = devices.map { it.name + "\n" + it.address }.toTypedArray()
+        var chosen = devices.indexOfFirst { it.address == current }.coerceAtLeast(0)
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Pilih printer Bluetooth")
+            .setSingleChoiceItems(labels, chosen) { _, which -> chosen = which }
+            .setPositiveButton("Lanjut") { _, _ ->
+                val p = devices[chosen]
+                pickPaper { mm ->
+                    prefs.edit()
+                        .putString("bt_address", p.address)
+                        .putString("bt_name", p.name)
+                        .putInt("paper_mm", mm)
+                        .apply()
+                    onPicked()
+                }
+            }
+            .setNeutralButton("Pengaturan Bluetooth") { _, _ ->
+                try { startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) } catch (_: Exception) { }
+                onCancel()
+            }
+            .setNegativeButton("Batal") { _, _ -> onCancel() }
+            .setOnCancelListener { onCancel() }
+            .show()
+    }
+
+    private fun pickPaper(onPicked: (Int) -> Unit) {
+        val sizes = intArrayOf(58, 80)
+        var chosen = if (paperMm() >= 80) 1 else 0
+        var done = false
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Lebar kertas")
+            .setSingleChoiceItems(arrayOf("58 mm (kecil)", "80 mm (besar)"), chosen) { _, w -> chosen = w }
+            .setPositiveButton("Simpan") { _, _ -> done = true; onPicked(sizes[chosen]) }
+            .setNegativeButton("Batal", null)
+            .setOnDismissListener { if (!done) onPicked(paperMm()) }
+            .show()
+    }
+
+    // --- Mencetak ke printer Bluetooth ---
+
+    /** Kirim byte ESC/POS yang dibuat di thread latar oleh [build]. */
+    private fun sendToBluetooth(job: String, build: () -> ByteArray) {
+        withBluetooth(
+            onReady = { printer ->
+                printExecutor.execute {
+                    try {
+                        btPrinter.send(printer.address, build())
+                        reportJob(job, true, "Tercetak di ${printer.name}")
+                    } catch (e: Throwable) {
+                        reportJob(job, false, "Gagal mencetak: ${e.message}")
+                    }
+                }
+            },
+            onCancel = { reportJob(job, false, "Dibatalkan") }
+        )
+    }
+
+    /**
+     * Cetak halaman yang sedang tampil ke printer thermal. Halaman di-render
+     * lewat mesin cetak WebView (jadi CSS @media print ikut dipakai) ke PDF
+     * selebar kertas, lalu PDF diubah menjadi gambar ESC/POS. Kalau cara itu
+     * gagal, tampilan layar yang digambar ulang dipakai sebagai cadangan.
+     */
+    private fun printPageBluetooth(job: String) {
+        withBluetooth(
+            onReady = { printer ->
+                toast("Menyiapkan cetakan...")
+                val dots = BluetoothPrinter.dotsForPaper(paperMm())
+                renderPageToPdf(dots) { pdf ->
+                    if (pdf != null) {
+                        printExecutor.execute {
+                            try {
+                                val bmp = BluetoothPrinter.renderPdf(pdf, dots)
+                                val data = BluetoothPrinter.encodeBitmap(bmp, dots)
+                                bmp.recycle()
+                                btPrinter.send(printer.address, data)
+                                reportJob(job, true, "Tercetak di ${printer.name}")
+                            } catch (e: Throwable) {
+                                reportJob(job, false, "Gagal mencetak: ${e.message}")
+                            } finally {
+                                pdf.delete()
+                            }
+                        }
+                    } else {
+                        printScreenshotBluetooth(job, printer, dots)
+                    }
+                }
+            },
+            onCancel = { reportJob(job, false, "Dibatalkan") }
+        )
+    }
+
+    private fun renderPageToPdf(dots: Int, done: (File?) -> Unit) {
+        try {
+            // Lebar halaman = lebar area cetak (203 dpi), tinggi dibuat panjang
+            // supaya struk tidak terpotong menjadi beberapa halaman
+            val widthMils = dots * 1000 / 203
+            val media = PrintAttributes.MediaSize("smesco_roll_$dots", "Roll", widthMils, 40000)
+            val attrs = PrintAttributes.Builder()
+                .setMediaSize(media)
+                .setResolution(PrintAttributes.Resolution("r203", "203 dpi", 203, 203))
+                .setMinMargins(PrintAttributes.Margins.NO_MARGINS)
+                .setColorMode(PrintAttributes.COLOR_MODE_MONOCHROME)
+                .build()
+            val dir = File(cacheDir, "print").apply { mkdirs() }
+            val out = File(dir, "page_${System.currentTimeMillis()}.pdf")
+            val adapter = webView.createPrintDocumentAdapter("smesco")
+            var finished = false
+            // Jaga-jaga kalau mesin cetak tidak pernah memanggil balik
+            val timeout = Runnable { if (!finished) { finished = true; done(null) } }
+            mainHandler.postDelayed(timeout, 20000)
+            PdfPrintHelper.writePdf(adapter, attrs, out) { ok, _ ->
+                if (finished) return@writePdf
+                finished = true
+                mainHandler.removeCallbacks(timeout)
+                done(if (ok && out.length() > 0) out else null)
+            }
+        } catch (e: Throwable) {
+            done(null)
+        }
+    }
+
+    /** Cadangan: gambar seluruh isi WebView ke bitmap selebar kertas. */
+    private fun printScreenshotBluetooth(job: String, printer: BluetoothPrinter.Printer, dots: Int) {
+        val bmp = try {
+            val viewW = webView.width.coerceAtLeast(1)
+            @Suppress("DEPRECATION")
+            val contentH = (webView.contentHeight * webView.scale).toInt().coerceAtLeast(webView.height)
+            val ratio = dots.toFloat() / viewW
+            val h = (contentH * ratio).toInt().coerceIn(1, 20000)
+            Bitmap.createBitmap(dots, h, Bitmap.Config.ARGB_8888).also {
+                val c = Canvas(it)
+                c.drawColor(Color.WHITE)
+                c.scale(ratio, ratio)
+                webView.draw(c)
+            }
+        } catch (e: Throwable) {
+            reportJob(job, false, "Gagal menyiapkan cetakan: ${e.message}")
+            return
+        }
+        printExecutor.execute {
+            try {
+                val data = BluetoothPrinter.encodeBitmap(BluetoothPrinter.trimBottom(bmp), dots)
+                btPrinter.send(printer.address, data)
+                reportJob(job, true, "Tercetak di ${printer.name}")
+            } catch (e: Throwable) {
+                reportJob(job, false, "Gagal mencetak: ${e.message}")
+            }
+        }
+    }
+
+    // ---------- Jembatan JavaScript ----------
+
+    /** `window.SmescoNative`: dipakai skrip bawaan (window.print, unduhan blob). */
+    inner class NativeBridge {
+        @JavascriptInterface
+        fun print(title: String?) {
+            if (!isTrustedUrl(currentUrl)) return
+            runOnUiThread { showPrintChooser(title ?: "") }
+        }
+
+        @JavascriptInterface
+        fun saveFile(dataUrl: String?, name: String?, openAfter: Boolean) {
+            if (!isTrustedUrl(currentUrl) || dataUrl == null) return
+            runOnUiThread { saveDataUrl(dataUrl, name ?: "", openAfter) }
+        }
+
+        @JavascriptInterface
+        fun saveFailed(message: String?) {
+            runOnUiThread { toast(message ?: "Berkas tidak bisa disimpan") }
+        }
+    }
+
+    /**
+     * `window.SmescoPrinter`: API printer untuk website. Fungsi cetak langsung
+     * mengembalikan id job; hasilnya dikirim lewat event `smescoprint`.
+     * Versi Promise tersedia sebagai `window.SmescoPrint` (lihat README).
+     */
+    inner class PrinterBridge {
+        private fun trusted() = isTrustedUrl(currentUrl)
+
+        @JavascriptInterface
+        fun isAvailable(): Boolean = trusted() && btPrinter.isSupported()
+
+        @JavascriptInterface
+        fun getPrinter(): String = if (trusted()) (printerJson()?.toString() ?: "null") else "null"
+
+        @JavascriptInterface
+        fun getColumns(): Int = BluetoothPrinter.charsForPaper(paperMm())
+
+        @JavascriptInterface
+        fun selectPrinter(): String {
+            val job = newJobId()
+            if (!trusted()) return job
+            runOnUiThread {
+                withBluetooth(
+                    forcePick = true,
+                    onReady = { reportJob(job, true, "Printer dipilih: ${it.name}", printerJson()) },
+                    onCancel = { reportJob(job, false, "Dibatalkan") }
+                )
+            }
+            return job
+        }
+
+        @JavascriptInterface
+        fun printText(text: String?): String = submit { BluetoothPrinter.encodeText(text ?: "") }
+
+        @JavascriptInterface
+        fun printRaw(base64: String?): String =
+            submit { Base64.decode(base64 ?: "", Base64.DEFAULT) }
+
+        @JavascriptInterface
+        fun printImage(dataUrl: String?): String = submit {
+            val bytes = DownloadSaver.decodeDataUrl(dataUrl ?: "").second
+            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                ?: throw IllegalArgumentException("Gambar tidak valid")
+            BluetoothPrinter.encodeBitmap(bmp, BluetoothPrinter.dotsForPaper(paperMm()))
+        }
+
+        @JavascriptInterface
+        fun printPage(): String {
+            val job = newJobId()
+            if (trusted()) runOnUiThread { printPageBluetooth(job) }
+            return job
+        }
+
+        @JavascriptInterface
+        fun systemPrint(title: String?) {
+            if (trusted()) runOnUiThread { systemPrint(title ?: "") }
+        }
+
+        private fun submit(build: () -> ByteArray): String {
+            val job = newJobId()
+            if (trusted()) runOnUiThread { sendToBluetooth(job, build) }
+            return job
+        }
+    }
+
     // ---------- Permissions ----------
 
     private fun requestInitialPermissions() {
@@ -304,12 +805,44 @@ class MainActivity : AppCompatActivity() {
 
         webView.webViewClient = createWebViewClient()
         webView.webChromeClient = createWebChromeClient()
+
+        webView.addJavascriptInterface(NativeBridge(), "SmescoNative")
+        webView.addJavascriptInterface(PrinterBridge(), "SmescoPrinter")
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            val host = Uri.parse(startUrl).host ?: ""
+            val rules = mutableSetOf("https://$host", "http://$host")
+            parentDomain(host)?.let { rules += "https://*.$it"; rules += "https://$it" }
+            WebViewCompat.addDocumentStartJavaScript(webView, PageScripts.BRIDGE, rules)
+        }
+    }
+
+    /** "smesco.kodesis.id" -> "kodesis.id" */
+    private fun parentDomain(host: String): String? {
+        val parts = host.split('.')
+        return if (parts.size > 2) parts.takeLast(2).joinToString(".") else null
+    }
+
+    /** Situs sendiri (domain startUrl atau subdomainnya). */
+    private fun isTrustedUrl(url: String?): Boolean {
+        val host = try { Uri.parse(url ?: return false).host } catch (e: Exception) { null } ?: return false
+        val own = Uri.parse(startUrl).host ?: return false
+        val base = parentDomain(own) ?: own
+        return host == own || host == base || host.endsWith(".$base")
+    }
+
+    /** Cadangan bila WebView terlalu tua untuk skrip document-start. Aman dipanggil berulang. */
+    private fun injectBridge(view: WebView?) {
+        if (view != null && isTrustedUrl(view.url)) view.evaluateJavascript(PageScripts.BRIDGE, null)
     }
 
     private fun createWebViewClient() = object : WebViewClient() {
         override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
             val url = request.url.toString()
             if (url.startsWith("http://") || url.startsWith("https://")) return false
+            if (url.startsWith("blob:") || url.startsWith("data:")) {
+                saveInPageUrl(url, "", openAfter = true)
+                return true
+            }
             // tel:, mailto:, whatsapp:, geo:, intent: ... hand off to the system
             return try {
                 startActivity(Intent(Intent.ACTION_VIEW, request.url))
@@ -320,8 +853,25 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+            super.onPageStarted(view, url, favicon)
+            currentUrl = url
+        }
+
+        override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+            super.doUpdateVisitedHistory(view, url, isReload)
+            currentUrl = url
+        }
+
+        override fun onPageCommitVisible(view: WebView?, url: String?) {
+            super.onPageCommitVisible(view, url)
+            injectBridge(view)
+        }
+
         override fun onPageFinished(view: WebView?, url: String?) {
             super.onPageFinished(view, url)
+            currentUrl = url
+            injectBridge(view)
             CookieManager.getInstance().flush()
             swipeRefresh.isRefreshing = false
             hideSplash()
@@ -465,6 +1015,8 @@ class MainActivity : AppCompatActivity() {
         hasPermission(Manifest.permission.ACCESS_FINE_LOCATION) ||
             hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
 
+    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+
     private fun hideSplash() {
         if (splashHidden) return
         splashHidden = true
@@ -482,5 +1034,5 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() { super.onPause(); webView.onPause(); CookieManager.getInstance().flush() }
     override fun onResume() { super.onResume(); webView.onResume() }
-    override fun onDestroy() { webView.destroy(); super.onDestroy() }
+    override fun onDestroy() { printExecutor.shutdown(); webView.destroy(); super.onDestroy() }
 }

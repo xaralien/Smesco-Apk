@@ -2,4 +2,6 @@
 <paths>
     <cache-path name="camera" path="camera/" />
     <external-files-path name="downloads" path="Download/" />
+    <!-- Folder Download publik, dipakai untuk membuka berkas blob: di Android 9 ke bawah -->
+    <external-path name="public_downloads" path="Download/" />
 </paths>
